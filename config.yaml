@@ -231,3 +231,9 @@ solver:
     solver: ipm
     run_crossover: on
     ipm_optimality_tolerance: 1e-5
+
+  gurobi:
+    name: gurobi
+    threads: 4
+    method: 2 # barrier
+    crossover: 0
