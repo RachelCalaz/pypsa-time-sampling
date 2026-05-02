@@ -237,3 +237,5 @@ solver:
     threads: 4
     method: 2 # barrier
     crossover: 0
+    BarIterLimit: 50000
+    TimeLimit: 36000
