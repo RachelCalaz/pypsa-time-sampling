@@ -18,15 +18,21 @@ from pathlib import Path
 from _helpers import (
     remove_leap_day,
     normalize_and_rename_df, 
-    assign_segmented_df_to_network,
 )
-
 
 """
 ********************************************************************************
     Time step reduction
 ********************************************************************************
 """
+
+def assign_ts_df_to_network(df, search_str, replace_str, target):
+    cols = df.columns[df.columns.str.contains(search_str)]
+    ts = df[cols]
+    ts.columns = ts.columns.str.replace(search_str, replace_str)
+    target.drop(target.columns, axis=1, inplace=True)
+    for col in ts.columns:
+        target[col] = ts[col]
 
 def average_every_nhours(n, offset):
     logging.info(f"Resampling the network to {offset}")
@@ -127,16 +133,151 @@ def apply_time_segmentation(n, segments, config):
     n.set_snapshots(segmented_df.index)
     n.snapshot_weightings = weightings   
     
-    assign_segmented_df_to_network(segmented_df, "_load", "", n.loads_t.p_set)
-    assign_segmented_df_to_network(segmented_df, "_max", "", n.generators_t.p_max_pu)
-    assign_segmented_df_to_network(segmented_df, "_min", "", n.generators_t.p_min_pu)
-    assign_segmented_df_to_network(segmented_df, "_inflow", "", n.storage_units_t.inflow)
+    assign_ts_df_to_network(segmented_df, "_load", "", n.loads_t.p_set)
+    assign_ts_df_to_network(segmented_df, "_max", "", n.generators_t.p_max_pu)
+    assign_ts_df_to_network(segmented_df, "_min", "", n.generators_t.p_min_pu)
+    assign_ts_df_to_network(segmented_df, "_inflow", "", n.storage_units_t.inflow)
+
+    return n
+
+def single_year_tsam_clustering(n, snapshots, periods, method, config):
+
+    p_max_pu, p_max_pu_max = normalize_and_rename_df(n.generators_t.p_max_pu, snapshots, 1, 'max')
+    load, load_max = normalize_and_rename_df(n.loads_t.p_set, snapshots, 1, "load")
+    inflow, inflow_max = normalize_and_rename_df(n.storage_units_t.inflow, snapshots, 0, "inflow")
+
+
+    raw = pd.concat([p_max_pu, load, inflow], axis=1, sort=False)
+
+    multi_index = False
+    if isinstance(raw.index, pd.MultiIndex):
+        multi_index = True
+        raw.index = raw.index.droplevel(0)
+        
+    y = snapshots.get_level_values(0)[0] if multi_index else snapshots[0].year
+
+    agg = tsam.TimeSeriesAggregation(
+        raw,
+        hoursPerPeriod=24,
+        noTypicalPeriods=int(periods),
+        clusterMethod=method,
+        solver=config["solver"],
+    )
+
+    clustered_df = agg.createTypicalPeriods()
+    clustered_df = clustered_df.reset_index(level=0, drop=True)
+    period_weightings = agg.clusterPeriodNoOccur
+
+    weightings = []
+    for typical_period in clustered_df.index.get_level_values(0).unique():
+        weight = period_weightings.loc[typical_period]
+        weightings.extend([weight] * 24)
+
+    weightings = pd.Series(weightings, name="weightings", dtype="float64")
+
+    start_snapshot = snapshots[0][1] if n.multi_invest else snapshots[0]
+
+    reduced_snapshots = pd.date_range(
+        start=start_snapshot,
+        periods=len(clustered_df),
+        freq="h",
+    )
+
+    if multi_index:
+        reduced_snapshots = pd.MultiIndex.from_arrays([[y] * len(reduced_snapshots), reduced_snapshots])
+
+    clustered_df.index = reduced_snapshots
+    weightings.index = reduced_snapshots
+
+    clustered_df[p_max_pu.columns] *= p_max_pu_max
+    clustered_df[load.columns] *= load_max
+    clustered_df[inflow.columns] *= inflow_max
+
+    logging.info(f"{method} clustering complete for period: {y}")
+
+    return clustered_df, weightings
+
+
+# delete this function
+def apply_time_segmentation(n, segments, config):
+    logging.info(f"Aggregating time series to {segments} segments.")    
+    years = n.investment_periods if n.multi_invest else [n.snapshots[0].year]
+
+    if len(years) == 1:
+        segmented_df, weightings = single_year_segmentation(n, n.snapshots, segments, config)
+    else:
+
+        with ProcessPoolExecutor(max_workers = min(len(years),config['nprocesses'])) as executor:
+            parallel_seg = {
+                year: executor.submit(
+                    single_year_segmentation,
+                    n,
+                    n.snapshots[n.snapshots.get_level_values(0) == year],
+                    segments,
+                    config
+                )
+                for year in years
+            }
+
+        segmented_df = pd.concat(
+            [parallel_seg[year].result()[0] for year in parallel_seg], axis=0
+        )
+        weightings = pd.concat(
+            [parallel_seg[year].result()[1] for year in parallel_seg], axis=0
+        )
+
+    n.set_snapshots(segmented_df.index)
+    n.snapshot_weightings = weightings   
+    
+    assign_ts_df_to_network(segmented_df, "_load", "", n.loads_t.p_set)
+    assign_ts_df_to_network(segmented_df, "_max", "", n.generators_t.p_max_pu)
+    assign_ts_df_to_network(segmented_df, "_min", "", n.generators_t.p_min_pu)
+    assign_ts_df_to_network(segmented_df, "_inflow", "", n.storage_units_t.inflow)
 
     return n
 
 
 
+def apply_time_tsam_clustering(n, periods, method, config):
+    logging.info(f"Aggregating time series to {periods} typical periods using {method}.")
+    years = n.investment_periods if n.multi_invest else [n.snapshots[0].year]
+
+    if len(years) == 1:
+        clustered_df, weightings = single_year_tsam_clustering(n, n.snapshots, periods, method, config)
+    else:
+        with ProcessPoolExecutor(max_workers=min(len(years), config["nprocesses"])) as executor:
+            parallel = {
+                year: executor.submit(
+                    single_year_tsam_clustering,
+                    n,
+                    n.snapshots[n.snapshots.get_level_values(0) == year],
+                    periods,
+                    method,
+                    config,
+                )
+                for year in years
+            }
+
+        clustered_df = pd.concat(
+            [parallel[year].result()[0] for year in parallel], axis=0
+            )
+        weightings = pd.concat(
+            [parallel[year].result()[1] for year in parallel], axis=0
+            )
+
+    n.set_snapshots(clustered_df.index)
+    n.snapshot_weightings = weightings
+
+    assign_ts_df_to_network(clustered_df, "_load", "", n.loads_t.p_set)
+    assign_ts_df_to_network(clustered_df, "_max", "", n.generators_t.p_max_pu)
+    assign_ts_df_to_network(clustered_df, "_min", "", n.generators_t.p_min_pu)
+    assign_ts_df_to_network(clustered_df, "_inflow", "", n.storage_units_t.inflow)
+
+    return n
+
+
 def apply_time_sampling(opts, n, tsam_clustering):
+
     # n average hours
     for o in opts:
         m = re.match(r"^\d+h$", o, re.IGNORECASE)
@@ -145,15 +286,22 @@ def apply_time_sampling(opts, n, tsam_clustering):
             break
 
     for o in opts:
-        # variable segmentation
-        m = re.match(r"^\d+SEG$", o, re.IGNORECASE)
-        if m is not None:
-            try:
-                import tsam.timeseriesaggregation as tsam
-                logging.info("Applying temporal segmentation")
-            except:
-                raise ModuleNotFoundError(
-                    "Optional dependency 'tsam' not found." "Install via 'pip install tsam'"
-                )
-            n = apply_time_segmentation(n, m[0][:-3], tsam_clustering)
-            break
+        m = re.match(r"^(\d+)(SEG|KMEANS|KMEDOIDS|HAC)$", o, re.IGNORECASE)
+        if m is None:
+            continue
+
+        n_periods = m.group(1)
+        op = m.group(2).lower()
+
+        if op == "seg":
+            # variable segmentation
+            n = apply_time_segmentation(n, n_periods, tsam_clustering)
+        else:
+            # kmeans, kmedoids and hac with tsam
+            method_map = {
+            "kmeans": "k_means",
+            "kmedoids": "k_medoids",
+            "hac": "hierarchical",
+            }
+            n = apply_time_tsam_clustering(n, n_periods, method_map[op], tsam_clustering)
+        break
