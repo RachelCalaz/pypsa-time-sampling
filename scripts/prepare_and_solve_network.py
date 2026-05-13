@@ -63,7 +63,7 @@ from pypsa.descriptors import get_switchable_as_dense as get_as_dense, expand_se
 from pypsa.optimization.common import reindex
 
 from _helpers import configure_logging, remove_leap_day, normalize_and_rename_df, assign_segmented_df_to_network, load_scenario_definition
-from add_electricity import load_extendable_parameters, apply_time_segmentation#, update_transmission_costs
+from add_electricity import load_extendable_parameters#, update_transmission_costs
 import xarray as xr
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning) # Comment out for debugging and development
@@ -71,6 +71,7 @@ from custom_constraints import set_operational_limits, ccgt_steam_constraints, r
 idx = pd.IndexSlice
 import os
 from add_electricity import check_pu_profiles
+from time_sampling import apply_time_sampling
 
 from xarray import DataArray
 """
@@ -495,7 +496,7 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             'prepare_and_solve_network', 
             **{
-                'scenario':"S1",
+                'scenario':"full_model",
             }
         )
     logging.basicConfig(
@@ -532,6 +533,10 @@ if __name__ == "__main__":
     full_outages_pu_max = pd.DataFrame()
 
     n = check_pu_profiles(n, snakemake.config["electricity"]["clean_pu_profiles"])
+
+    # Apply time sampling methods
+    opts = SCENARIO_SETUP["options"].split("-")
+    apply_time_sampling(opts, n, snakemake.config["tsam_clustering"])
 
     if snakemake.config["costs"]["noisy_costs"]:
         add_noisy_costs(n, snakemake.config)

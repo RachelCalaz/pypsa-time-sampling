@@ -185,7 +185,7 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "base_network", 
             **{
-                "scenario":"S1",
+                "scenario":"full_model",
                 "year":2045,
             }
         )

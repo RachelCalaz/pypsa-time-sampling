@@ -12,6 +12,8 @@ import warnings
 warnings.simplefilter(action="ignore") # Comment out for debugging and development
 import re
 import tsam.timeseriesaggregation as tsam
+from tslearn.clustering import KShape
+from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 
 from pathlib import Path
 
@@ -146,7 +148,6 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
     load, load_max = normalize_and_rename_df(n.loads_t.p_set, snapshots, 1, "load")
     inflow, inflow_max = normalize_and_rename_df(n.storage_units_t.inflow, snapshots, 0, "inflow")
 
-
     raw = pd.concat([p_max_pu, load, inflow], axis=1, sort=False)
 
     multi_index = False
@@ -165,12 +166,13 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
     )
 
     clustered_df = agg.createTypicalPeriods()
+    period_ids = clustered_df.index.get_level_values(0).unique()
+    period_weightings = agg.clusterPeriodNoOccur 
     clustered_df = clustered_df.reset_index(level=0, drop=True)
-    period_weightings = agg.clusterPeriodNoOccur
 
     weightings = []
-    for typical_period in clustered_df.index.get_level_values(0).unique():
-        weight = period_weightings.loc[typical_period]
+    for typical_period in period_ids:
+        weight = period_weightings[typical_period]
         weightings.extend([weight] * 24)
 
     weightings = pd.Series(weightings, name="weightings", dtype="float64")
@@ -198,44 +200,129 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
     return clustered_df, weightings
 
 
-# delete this function
-def apply_time_segmentation(n, segments, config):
-    logging.info(f"Aggregating time series to {segments} segments.")    
+def single_year_kshape_clustering(n, snapshots, periods, config):
+
+    if KShape is None or TimeSeriesScalerMeanVariance is None:
+        raise ImportError("KSHAPE requires tslearn. Install with: pip install tslearn")
+
+    p_max_pu, p_max_pu_max = normalize_and_rename_df(n.generators_t.p_max_pu, snapshots, 1, "max")
+    load, load_max = normalize_and_rename_df(n.loads_t.p_set, snapshots, 1, "load")
+    inflow, inflow_max = normalize_and_rename_df(n.storage_units_t.inflow, snapshots, 0, "inflow")
+
+    raw = pd.concat([p_max_pu, load, inflow], axis=1, sort=False)
+
+    multi_index = False
+    if isinstance(raw.index, pd.MultiIndex):
+        multi_index = True
+        raw.index = raw.index.droplevel(0)
+
+    y = snapshots.get_level_values(0)[0] if multi_index else snapshots[0].year
+
+    n_days = len(raw) // 24
+    values = raw.to_numpy().reshape(n_days, 24, raw.shape[1])
+
+    scaled = TimeSeriesScalerMeanVariance(mu=0.0, std=1.0).fit_transform(values)
+
+    model = KShape(
+        n_clusters=int(periods),
+        random_state=config.get("random_seed", 0),
+        max_iter=config.get("kshape_max_iter", 100),
+        n_init=config.get("kshape_n_init", 1),
+    )
+
+    labels = model.fit_predict(scaled)
+
+    typical_days = []
+    weights = []
+
+    for cluster_id in range(int(periods)):
+        members = values[labels == cluster_id]
+
+        if len(members) == 0:
+            continue
+
+        typical_days.append(members.mean(axis=0))
+        weights.append(float(len(members)))
+
+    clustered_df = pd.DataFrame(
+        np.vstack(typical_days),
+        columns=raw.columns,
+    )
+
+    weightings = []
+    for w in weights:
+        weightings.extend([w] * 24)
+
+    start_snapshot = snapshots[0][1] if n.multi_invest else snapshots[0]
+
+    reduced_snapshots = pd.date_range(
+        start=start_snapshot,
+        periods=len(clustered_df),
+        freq="h",
+    )
+
+    if multi_index:
+        reduced_snapshots = pd.MultiIndex.from_arrays(
+            [[y] * len(reduced_snapshots), reduced_snapshots]
+        )
+
+    clustered_df.index = reduced_snapshots
+    weightings = pd.Series(
+        weightings,
+        index=reduced_snapshots,
+        name="weightings",
+        dtype="float64",
+    )
+
+    clustered_df[p_max_pu.columns] *= p_max_pu_max
+    clustered_df[load.columns] *= load_max
+    clustered_df[inflow.columns] *= inflow_max
+
+    logging.info(f"KSHAPE clustering complete for period: {y}")
+
+    return clustered_df, weightings
+
+
+
+
+def apply_time_kshape_clustering(n, periods, config):
+    logging.info(f"Aggregating time series to {periods} typical periods using KSHAPE.")
+
     years = n.investment_periods if n.multi_invest else [n.snapshots[0].year]
 
     if len(years) == 1:
-        segmented_df, weightings = single_year_segmentation(n, n.snapshots, segments, config)
+        clustered_df, weightings = single_year_kshape_clustering(n, n.snapshots, periods, config)
     else:
-
-        with ProcessPoolExecutor(max_workers = min(len(years),config['nprocesses'])) as executor:
-            parallel_seg = {
+        with ProcessPoolExecutor(max_workers=min(len(years), config["nprocesses"])) as executor:
+            parallel = {
                 year: executor.submit(
-                    single_year_segmentation,
+                    single_year_kshape_clustering,
                     n,
                     n.snapshots[n.snapshots.get_level_values(0) == year],
-                    segments,
-                    config
+                    periods,
+                    config,
                 )
                 for year in years
             }
 
-        segmented_df = pd.concat(
-            [parallel_seg[year].result()[0] for year in parallel_seg], axis=0
+        clustered_df = pd.concat(
+            [parallel[year].result()[0] for year in parallel],
+            axis=0,
         )
         weightings = pd.concat(
-            [parallel_seg[year].result()[1] for year in parallel_seg], axis=0
+            [parallel[year].result()[1] for year in parallel],
+            axis=0,
         )
 
-    n.set_snapshots(segmented_df.index)
-    n.snapshot_weightings = weightings   
-    
-    assign_ts_df_to_network(segmented_df, "_load", "", n.loads_t.p_set)
-    assign_ts_df_to_network(segmented_df, "_max", "", n.generators_t.p_max_pu)
-    assign_ts_df_to_network(segmented_df, "_min", "", n.generators_t.p_min_pu)
-    assign_ts_df_to_network(segmented_df, "_inflow", "", n.storage_units_t.inflow)
+    n.set_snapshots(clustered_df.index)
+    n.snapshot_weightings = weightings
+
+    assign_ts_df_to_network(clustered_df, "_load", "", n.loads_t.p_set)
+    assign_ts_df_to_network(clustered_df, "_max", "", n.generators_t.p_max_pu)
+    assign_ts_df_to_network(clustered_df, "_min", "", n.generators_t.p_min_pu)
+    assign_ts_df_to_network(clustered_df, "_inflow", "", n.storage_units_t.inflow)
 
     return n
-
 
 
 def apply_time_tsam_clustering(n, periods, method, config):
@@ -286,7 +373,7 @@ def apply_time_sampling(opts, n, tsam_clustering):
             break
 
     for o in opts:
-        m = re.match(r"^(\d+)(SEG|KMEANS|KMEDOIDS|HAC)$", o, re.IGNORECASE)
+        m = re.match(r"^(\d+)(SEG|KMEANS|KMEDOIDS|HAC|KSHAPE)$", o, re.IGNORECASE)
         if m is None:
             continue
 
@@ -296,7 +383,9 @@ def apply_time_sampling(opts, n, tsam_clustering):
         if op == "seg":
             # variable segmentation
             n = apply_time_segmentation(n, n_periods, tsam_clustering)
-        else:
+        if op == "kshape":
+            n = apply_time_kshape_clustering(n, n_periods, tsam_clustering)
+        if op in ["kmeans", "kmedoids", "hac"]:
             # kmeans, kmedoids and hac with tsam
             method_map = {
             "kmeans": "k_means",

@@ -236,6 +236,7 @@ solver:
     name: gurobi
     threads: 4
     method: 2 # barrier
+    BarHomogeneous: 1
     crossover: 0
     BarIterLimit: 50000
     TimeLimit: 36000

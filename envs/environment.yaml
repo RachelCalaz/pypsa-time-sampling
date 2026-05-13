@@ -48,3 +48,4 @@ dependencies:
   - yaml
   - ipykernel
   - tsam
+  - tslearn
