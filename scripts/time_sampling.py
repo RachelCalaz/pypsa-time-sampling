@@ -11,6 +11,7 @@ import xarray as xr
 import warnings
 warnings.simplefilter(action="ignore") # Comment out for debugging and development
 import re
+import time
 import tsam.timeseriesaggregation as tsam
 from tslearn.clustering import KShape
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
@@ -22,19 +23,31 @@ from _helpers import (
     normalize_and_rename_df, 
 )
 
+PMIN_SUFFIX = "__pmin"
+
 """
 ********************************************************************************
     Time step reduction
 ********************************************************************************
 """
 
-def assign_ts_df_to_network(df, search_str, replace_str, target):
-    cols = df.columns[df.columns.str.contains(search_str)]
-    ts = df[cols]
-    ts.columns = ts.columns.str.replace(search_str, replace_str)
-    target.drop(target.columns, axis=1, inplace=True)
-    for col in ts.columns:
-        target[col] = ts[col]
+def assign_reduced_ts(n_attr, reduced_df):
+    if n_attr.empty:
+        return n_attr
+    cols = n_attr.columns.intersection(reduced_df.columns)
+    return reduced_df[cols]
+
+
+def _write_reduced_to_network(n, reduced_df):
+    pmin_cols = reduced_df.columns[reduced_df.columns.str.endswith(PMIN_SUFFIX)]
+    pmin_df = reduced_df[pmin_cols].rename(columns=lambda c: c[: -len(PMIN_SUFFIX)])
+    other_df = reduced_df.drop(columns=pmin_cols)
+
+    n.generators_t.p_max_pu = assign_reduced_ts(n.generators_t.p_max_pu, other_df)
+    n.generators_t.p_min_pu = assign_reduced_ts(n.generators_t.p_min_pu, pmin_df)
+    n.loads_t.p_set = assign_reduced_ts(n.loads_t.p_set, other_df)
+    n.storage_units_t.inflow = assign_reduced_ts(n.storage_units_t.inflow, other_df)
+
 
 def average_every_nhours(n, offset):
     logging.info(f"Resampling the network to {offset}")
@@ -61,17 +74,23 @@ def average_every_nhours(n, offset):
 
 def single_year_segmentation(n, snapshots, segments, config):
 
-    p_max_pu, p_max_pu_max = normalize_and_rename_df(n.generators_t.p_max_pu, snapshots, 1, 'max')
-    load, load_max = normalize_and_rename_df(n.loads_t.p_set, snapshots, 1, "load")
-    inflow, inflow_max = normalize_and_rename_df(n.storage_units_t.inflow, snapshots, 0, "inflow")
+    p_max_pu_norm = n.generators_t.p_max_pu.loc[snapshots].abs().max().clip(lower=1e-6)
+    p_min_pu_norm = n.generators_t.p_min_pu.loc[snapshots].abs().max().clip(lower=1e-6)
+    load_norm = n.loads_t.p_set.loc[snapshots].abs().max().clip(lower=1e-6)
+    inflow_norm = n.storage_units_t.inflow.loc[snapshots].abs().max().clip(lower=1e-6)
 
-    raw = pd.concat([p_max_pu, load, inflow], axis=1, sort=False)
+    p_max_pu = (n.generators_t.p_max_pu.loc[snapshots] / p_max_pu_norm).fillna(1)
+    p_min_pu = (n.generators_t.p_min_pu.loc[snapshots] / p_min_pu_norm).fillna(0).add_suffix(PMIN_SUFFIX)
+    load = (n.loads_t.p_set.loc[snapshots] / load_norm).fillna(1)
+    inflow = (n.storage_units_t.inflow.loc[snapshots] / inflow_norm).fillna(0)
+
+    raw = pd.concat([p_max_pu, p_min_pu, load, inflow], axis=1, sort=False)
 
     multi_index = False
     if isinstance(raw.index, pd.MultiIndex):
         multi_index = True
         raw.index = raw.index.droplevel(0)
-        
+
     y = snapshots.get_level_values(0)[0] if multi_index else snapshots[0].year
 
     agg = tsam.TimeSeriesAggregation(
@@ -80,26 +99,31 @@ def single_year_segmentation(n, snapshots, segments, config):
         noTypicalPeriods=1,
         noSegments=int(segments),
         segmentation=True,
-        solver=config['solver'],
+        solver=config.get('solver_name', 'highs'),
     )
 
     segmented_df = agg.createTypicalPeriods()
     weightings = segmented_df.index.get_level_values("Segment Duration")
     cumsum = np.cumsum(weightings[:-1])
-    
-    if np.floor(y/4)-y/4 == 0: # check if leap year and add Feb 29 
-            cumsum = np.where(cumsum >= 1416, cumsum + 24, cumsum) # 1416h from start year to Feb 29
-    
+
+    if np.floor(y/4)-y/4 == 0: # check if leap year and add Feb 29
+        cumsum = np.where(cumsum >= 1416, cumsum + 24, cumsum)
+
     offsets = np.insert(cumsum, 0, 0)
     start_snapshot = snapshots[0][1] if n.multi_invest else snapshots[0]
-    snapshots = pd.DatetimeIndex([start_snapshot + pd.Timedelta(hours=offset) for offset in offsets])
-    snapshots = pd.MultiIndex.from_arrays([snapshots.year, snapshots]) if multi_index else snapshots
-    weightings = pd.Series(weightings, index=snapshots, name="weightings", dtype="float64")
-    segmented_df.index = snapshots
+    new_snapshots = pd.DatetimeIndex([start_snapshot + pd.Timedelta(hours=offset) for offset in offsets])
+    if multi_index:
+        new_snapshots = pd.MultiIndex.from_arrays(
+            [new_snapshots.year.astype(int), new_snapshots],
+            names=n.snapshots.names,
+        )
+    weightings = pd.Series(weightings, index=new_snapshots, name="weightings", dtype="float64")
+    segmented_df.index = new_snapshots
 
-    segmented_df[p_max_pu.columns] *= p_max_pu_max
-    segmented_df[load.columns] *= load_max
-    segmented_df[inflow.columns] *= inflow_max
+    segmented_df[p_max_pu.columns] *= p_max_pu_norm.values
+    segmented_df[p_min_pu.columns] *= p_min_pu_norm.values
+    segmented_df[load.columns] *= load_norm.values
+    segmented_df[inflow.columns] *= inflow_norm.values
      
     logging.info(f"Segmentation complete for period: {y}")
 
@@ -134,27 +158,30 @@ def apply_time_segmentation(n, segments, config):
 
     n.set_snapshots(segmented_df.index)
     n.snapshot_weightings = weightings   
-    
-    assign_ts_df_to_network(segmented_df, "_load", "", n.loads_t.p_set)
-    assign_ts_df_to_network(segmented_df, "_max", "", n.generators_t.p_max_pu)
-    assign_ts_df_to_network(segmented_df, "_min", "", n.generators_t.p_min_pu)
-    assign_ts_df_to_network(segmented_df, "_inflow", "", n.storage_units_t.inflow)
+
+    _write_reduced_to_network(n, segmented_df)
 
     return n
 
 def single_year_tsam_clustering(n, snapshots, periods, method, config):
 
-    p_max_pu, p_max_pu_max = normalize_and_rename_df(n.generators_t.p_max_pu, snapshots, 1, 'max')
-    load, load_max = normalize_and_rename_df(n.loads_t.p_set, snapshots, 1, "load")
-    inflow, inflow_max = normalize_and_rename_df(n.storage_units_t.inflow, snapshots, 0, "inflow")
+    p_max_pu_norm = n.generators_t.p_max_pu.loc[snapshots].abs().max().clip(lower=1e-6)
+    p_min_pu_norm = n.generators_t.p_min_pu.loc[snapshots].abs().max().clip(lower=1e-6)
+    load_norm = n.loads_t.p_set.loc[snapshots].abs().max().clip(lower=1e-6)
+    inflow_norm = n.storage_units_t.inflow.loc[snapshots].abs().max().clip(lower=1e-6)
 
-    raw = pd.concat([p_max_pu, load, inflow], axis=1, sort=False)
+    p_max_pu = (n.generators_t.p_max_pu.loc[snapshots] / p_max_pu_norm).fillna(1)
+    p_min_pu = (n.generators_t.p_min_pu.loc[snapshots] / p_min_pu_norm).fillna(0).add_suffix(PMIN_SUFFIX)
+    load = (n.loads_t.p_set.loc[snapshots] / load_norm).fillna(1)
+    inflow = (n.storage_units_t.inflow.loc[snapshots] / inflow_norm).fillna(0)
+
+    raw = pd.concat([p_max_pu, p_min_pu, load, inflow], axis=1, sort=False)
 
     multi_index = False
     if isinstance(raw.index, pd.MultiIndex):
         multi_index = True
         raw.index = raw.index.droplevel(0)
-        
+
     y = snapshots.get_level_values(0)[0] if multi_index else snapshots[0].year
 
     agg = tsam.TimeSeriesAggregation(
@@ -162,12 +189,12 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
         hoursPerPeriod=24,
         noTypicalPeriods=int(periods),
         clusterMethod=method,
-        solver=config["solver"],
+        solver=config.get("solver_name", "highs"),
     )
 
     clustered_df = agg.createTypicalPeriods()
     period_ids = clustered_df.index.get_level_values(0).unique()
-    period_weightings = agg.clusterPeriodNoOccur 
+    period_weightings = agg.clusterPeriodNoOccur
     clustered_df = clustered_df.reset_index(level=0, drop=True)
 
     weightings = []
@@ -186,14 +213,18 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
     )
 
     if multi_index:
-        reduced_snapshots = pd.MultiIndex.from_arrays([[y] * len(reduced_snapshots), reduced_snapshots])
+        reduced_snapshots = pd.MultiIndex.from_arrays(
+            [np.array([y] * len(reduced_snapshots), dtype=int), reduced_snapshots],
+            names=snapshots.names,
+        )
 
     clustered_df.index = reduced_snapshots
     weightings.index = reduced_snapshots
 
-    clustered_df[p_max_pu.columns] *= p_max_pu_max
-    clustered_df[load.columns] *= load_max
-    clustered_df[inflow.columns] *= inflow_max
+    clustered_df[p_max_pu.columns] *= p_max_pu_norm.values
+    clustered_df[p_min_pu.columns] *= p_min_pu_norm.values
+    clustered_df[load.columns] *= load_norm.values
+    clustered_df[inflow.columns] *= inflow_norm.values
 
     logging.info(f"{method} clustering complete for period: {y}")
 
@@ -205,11 +236,17 @@ def single_year_kshape_clustering(n, snapshots, periods, config):
     if KShape is None or TimeSeriesScalerMeanVariance is None:
         raise ImportError("KSHAPE requires tslearn. Install with: pip install tslearn")
 
-    p_max_pu, p_max_pu_max = normalize_and_rename_df(n.generators_t.p_max_pu, snapshots, 1, "max")
-    load, load_max = normalize_and_rename_df(n.loads_t.p_set, snapshots, 1, "load")
-    inflow, inflow_max = normalize_and_rename_df(n.storage_units_t.inflow, snapshots, 0, "inflow")
+    p_max_pu_norm = n.generators_t.p_max_pu.loc[snapshots].abs().max().clip(lower=1e-6)
+    p_min_pu_norm = n.generators_t.p_min_pu.loc[snapshots].abs().max().clip(lower=1e-6)
+    load_norm = n.loads_t.p_set.loc[snapshots].abs().max().clip(lower=1e-6)
+    inflow_norm = n.storage_units_t.inflow.loc[snapshots].abs().max().clip(lower=1e-6)
 
-    raw = pd.concat([p_max_pu, load, inflow], axis=1, sort=False)
+    p_max_pu = (n.generators_t.p_max_pu.loc[snapshots] / p_max_pu_norm).fillna(1)
+    p_min_pu = (n.generators_t.p_min_pu.loc[snapshots] / p_min_pu_norm).fillna(0).add_suffix(PMIN_SUFFIX)
+    load = (n.loads_t.p_set.loc[snapshots] / load_norm).fillna(1)
+    inflow = (n.storage_units_t.inflow.loc[snapshots] / inflow_norm).fillna(0)
+
+    raw = pd.concat([p_max_pu, p_min_pu, load, inflow], axis=1, sort=False)
 
     multi_index = False
     if isinstance(raw.index, pd.MultiIndex):
@@ -263,7 +300,8 @@ def single_year_kshape_clustering(n, snapshots, periods, config):
 
     if multi_index:
         reduced_snapshots = pd.MultiIndex.from_arrays(
-            [[y] * len(reduced_snapshots), reduced_snapshots]
+            [np.array([y] * len(reduced_snapshots), dtype=int), reduced_snapshots],
+            names=snapshots.names,
         )
 
     clustered_df.index = reduced_snapshots
@@ -274,9 +312,10 @@ def single_year_kshape_clustering(n, snapshots, periods, config):
         dtype="float64",
     )
 
-    clustered_df[p_max_pu.columns] *= p_max_pu_max
-    clustered_df[load.columns] *= load_max
-    clustered_df[inflow.columns] *= inflow_max
+    clustered_df[p_max_pu.columns] *= p_max_pu_norm.values
+    clustered_df[p_min_pu.columns] *= p_min_pu_norm.values
+    clustered_df[load.columns] *= load_norm.values
+    clustered_df[inflow.columns] *= inflow_norm.values
 
     logging.info(f"KSHAPE clustering complete for period: {y}")
 
@@ -317,10 +356,7 @@ def apply_time_kshape_clustering(n, periods, config):
     n.set_snapshots(clustered_df.index)
     n.snapshot_weightings = weightings
 
-    assign_ts_df_to_network(clustered_df, "_load", "", n.loads_t.p_set)
-    assign_ts_df_to_network(clustered_df, "_max", "", n.generators_t.p_max_pu)
-    assign_ts_df_to_network(clustered_df, "_min", "", n.generators_t.p_min_pu)
-    assign_ts_df_to_network(clustered_df, "_inflow", "", n.storage_units_t.inflow)
+    _write_reduced_to_network(n, clustered_df)
 
     return n
 
@@ -355,10 +391,7 @@ def apply_time_tsam_clustering(n, periods, method, config):
     n.set_snapshots(clustered_df.index)
     n.snapshot_weightings = weightings
 
-    assign_ts_df_to_network(clustered_df, "_load", "", n.loads_t.p_set)
-    assign_ts_df_to_network(clustered_df, "_max", "", n.generators_t.p_max_pu)
-    assign_ts_df_to_network(clustered_df, "_min", "", n.generators_t.p_min_pu)
-    assign_ts_df_to_network(clustered_df, "_inflow", "", n.storage_units_t.inflow)
+    _write_reduced_to_network(n, clustered_df)
 
     return n
 
@@ -369,7 +402,9 @@ def apply_time_sampling(opts, n, tsam_clustering):
     for o in opts:
         m = re.match(r"^\d+h$", o, re.IGNORECASE)
         if m is not None:
+            t0 = time.perf_counter()
             n = average_every_nhours(n, m[0])
+            logging.info(f"Time sampling ({m[0]} averaging) completed in {time.perf_counter() - t0:.1f}s")
             break
 
     for o in opts:
@@ -379,6 +414,7 @@ def apply_time_sampling(opts, n, tsam_clustering):
 
         n_periods = m.group(1)
         op = m.group(2).lower()
+        t0 = time.perf_counter()
 
         if op == "seg":
             # variable segmentation
@@ -393,4 +429,13 @@ def apply_time_sampling(opts, n, tsam_clustering):
             "hac": "hierarchical",
             }
             n = apply_time_tsam_clustering(n, n_periods, method_map[op], tsam_clustering)
+
+        elapsed = time.perf_counter() - t0
+        mins, secs = divmod(elapsed, 60)
+        logging.info(
+            f"Time sampling ({n_periods}{op.upper()}) completed in "
+            f"{int(mins)}m {secs:.1f}s ({elapsed:.1f}s total)"
+        )
         break
+
+    return n

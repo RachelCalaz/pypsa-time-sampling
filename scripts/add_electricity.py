@@ -158,6 +158,7 @@ import tsam.timeseriesaggregation as tsam
 
 from pathlib import Path
 
+from time_sampling import apply_time_sampling
 from _helpers import (
     add_missing_carriers,
     add_noise,
@@ -1589,6 +1590,10 @@ if __name__ == "__main__":
     gen_emissions.to_csv(snakemake.output[1])
     gen_stand_by_emissions.to_csv(snakemake.output[2])
 
+    # Apply time sampling methods
+    opts = SCENARIO_SETUP["options"].split("-")
+    n = apply_time_sampling(opts, n, snakemake.config["tsam_clustering"])
+    
     logging.info("Checking pu_profiles for infeasibilities")
     n = check_pu_profiles(n, snakemake.config["electricity"]["clean_pu_profiles"])
 

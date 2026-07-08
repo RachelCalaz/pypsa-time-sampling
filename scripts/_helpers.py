@@ -762,11 +762,12 @@ def drop_non_pypsa_attrs(n, c, df):
     return df
 
 def normalize_and_rename_df(df, snapshots, fillna, suffix=None):
-    df = df.loc[snapshots]
+    df = df.loc[snapshots].copy()
+    max_vals = df.max()    
     df = (df / df.max()).fillna(fillna)
     if suffix:
         df.columns += f'_{suffix}'
-    return df, df.max()
+    return df, max_vals.fillna(0)
 
 def find_string_entries(series):
     return series[series.apply(lambda x: isinstance(x, str))]#.index

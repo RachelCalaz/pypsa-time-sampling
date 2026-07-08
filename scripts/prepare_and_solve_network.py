@@ -71,7 +71,6 @@ from custom_constraints import set_operational_limits, ccgt_steam_constraints, r
 idx = pd.IndexSlice
 import os
 from add_electricity import check_pu_profiles
-from time_sampling import apply_time_sampling
 
 from xarray import DataArray
 """
@@ -533,10 +532,6 @@ if __name__ == "__main__":
     full_outages_pu_max = pd.DataFrame()
 
     n = check_pu_profiles(n, snakemake.config["electricity"]["clean_pu_profiles"])
-
-    # Apply time sampling methods
-    opts = SCENARIO_SETUP["options"].split("-")
-    apply_time_sampling(opts, n, snakemake.config["tsam_clustering"])
 
     if snakemake.config["costs"]["noisy_costs"]:
         add_noisy_costs(n, snakemake.config)
