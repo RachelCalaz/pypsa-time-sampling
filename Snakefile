@@ -85,6 +85,7 @@ rule add_electricity:
         network = "networks/" + config["scenarios"]["working_folder"] + "/{scenario}/elec.nc",
         gen_emissions = "results/" + config["scenarios"]["working_folder"] + "/{scenario}/outputs/generator_emissions.csv",
         gen_stand_by_emissions = "results/" + config["scenarios"]["working_folder"] + "/{scenario}/outputs/generator_stand_by_emissions.csv",
+    threads: workflow.cores
     script: "scripts/add_electricity.py"
 
 rule prepare_and_solve_network:
@@ -99,7 +100,10 @@ rule prepare_and_solve_network:
         capacity_value = "results/" + config["scenarios"]["working_folder"] + "/{scenario}/outputs/capacity_value.csv",
         decom_status = "results/" + config["scenarios"]["working_folder"] + "/{scenario}/outputs/decom_status.csv",
         full_outages = "results/" + config["scenarios"]["working_folder"] + "/{scenario}/outputs/full_outages.csv",
+    benchmark:
+        "results/" + config["scenarios"]["working_folder"] + "/{scenario}/outputs/benchmark.tsv"
     resources:
         solver_slots=1
+    threads: workflow.cores
     script:
         "scripts/prepare_and_solve_network.py"

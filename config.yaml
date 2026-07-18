@@ -210,7 +210,7 @@ solver:
     #BarGapTol: 1e-6
     #RelGap: 1
     #AbsGap: 1e5
-    BarHomogeneous: 0
+    BarHomogeneous: 1
     #MatrixTol: 1e-7
     keep_files: True
 
@@ -234,9 +234,8 @@ solver:
 
   gurobi:
     name: gurobi
-    threads: 4
     method: 2 # barrier
-    BarHomogeneous: 1
+    BarHomogeneous: 0
     crossover: 0
     BarIterLimit: 50000
     TimeLimit: 36000
