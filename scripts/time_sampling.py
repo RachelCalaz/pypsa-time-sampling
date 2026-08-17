@@ -161,6 +161,12 @@ def apply_time_segmentation(n, segments, config):
 
     _write_reduced_to_network(n, segmented_df)
 
+    # Adjusting ramp limits by snapshot weightings for segmentation method only
+    weights = n.snapshot_weightings.objective
+    gens = n.generators.index[n.generators['ramp_limit_up'].notnull()]
+    n.generators_t['ramp_limit_up'] = pd.DataFrame(weights.values[:, None] * n.generators.loc[gens, 'ramp_limit_up'].values,index=n.snapshots, columns=gens).clip(upper=1)
+    n.generators_t['ramp_limit_down'] = pd.DataFrame(weights.values[:, None] * n.generators.loc[gens, 'ramp_limit_down'].values,index=n.snapshots, columns=gens).clip(upper=1)
+
     return n
 
 def single_year_tsam_clustering(n, snapshots, periods, method, config):
@@ -177,6 +183,20 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
 
     raw = pd.concat([p_max_pu, p_min_pu, load, inflow], axis=1, sort=False)
 
+    PeakMax = ['peak_load', 'peak_solar', 'peak_wind']
+    PeakMin = ['peak_load', 'peak_vre']
+
+    raw['peak_load'] = load.sum(axis=1)
+
+    solar_carriers = ['solar_pv', 'solar_pv_low']
+    wind_carriers = ['wind', 'wind_low']
+    solar_cl = n.generators.query('carrier in @solar_carriers').index
+    wind_cl = n.generators.query('carrier in @wind_carriers').index
+
+    raw['peak_solar'] = p_max_pu[solar_cl].sum(axis=1)
+    raw['peak_wind'] = p_max_pu[wind_cl].sum(axis=1)
+    raw['peak_vre'] = raw['peak_solar'] + raw['peak_wind']
+
     multi_index = False
     if isinstance(raw.index, pd.MultiIndex):
         multi_index = True
@@ -190,12 +210,15 @@ def single_year_tsam_clustering(n, snapshots, periods, method, config):
         noTypicalPeriods=int(periods),
         clusterMethod=method,
         solver=config.get("solver_name", "highs"),
+        extremePeriodMethod="new_cluster_center",
+        addPeakMax=PeakMax,
+        addPeakMin=PeakMin,
     )
 
     clustered_df = agg.createTypicalPeriods()
     period_ids = clustered_df.index.get_level_values(0).unique()
     period_weightings = agg.clusterPeriodNoOccur
-    clustered_df = clustered_df.reset_index(level=0, drop=True)
+    clustered_df = clustered_df.drop(columns = ['peak_load', 'peak_vre', 'peak_wind', 'peak_solar']).reset_index(level=0, drop=True)
 
     weightings = []
     for typical_period in period_ids:
