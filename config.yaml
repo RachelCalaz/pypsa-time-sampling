@@ -19,7 +19,7 @@ random_seed: 174
 
 scenarios:
   input_folder: scenarios
-  working_folder: time_sampling #kept only on local machine
+  working_folder: time_sampling_base #kept only on local machine
   setup: "scenarios_to_run.xlsx"
 
 data_paths:
@@ -234,6 +234,7 @@ solver:
 
   gurobi:
     name: gurobi
+    Seed: 123
     method: 2 # barrier
     BarHomogeneous: 0
     crossover: 0
